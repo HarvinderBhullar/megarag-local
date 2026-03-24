@@ -5,6 +5,7 @@ import re
 import time
 from typing import Optional
 import numpy as np
+import ray
 from openai import OpenAI
 from config.settings import get_settings
 
@@ -358,6 +359,94 @@ def _link_isolated_nodes(
     return new_relations
 
 
+@ray.remote
+def _refine_page_remote(
+    page_text: str,
+    page_entities: list[dict],
+    page_relations: list[dict],
+    relevant_entities: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Ray remote: Stage 2 refinement for a single page (LLM call only).
+    relevant_entities is pre-computed by the caller so ColQwen is not needed here.
+    """
+    cfg = get_settings()
+    client, model = _build_client(cfg)
+    # Build subgraph block directly from pre-computed relevant_entities
+    ent_lines = "\n".join(
+        f'  - {e["name"]} ({e.get("type", "OTHER")}): {e.get("description", "")}'
+        for e in relevant_entities
+    )
+    rel_lines = "\n".join(
+        f'  - {r["source"]} --[{r["relation"]}]--> {r["target"]}'
+        for r in page_relations[:_MAX_SUBGRAPH_RELATIONS]
+    )
+    subgraph_block = (
+        f"Known entities:\n{ent_lines or '  (none)'}\n\n"
+        f"Known relations:\n{rel_lines or '  (none)'}"
+    )
+    user_content = f"{page_text}\n\n---\nCurrent subgraph for this page:\n{subgraph_block}"
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _REFINE_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0,
+        max_tokens=_MAX_TOKENS,
+    )
+    raw = response.choices[0].message.content or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = _recover_partial_json(raw)
+    return data.get("new_entities", []), data.get("new_relations", [])
+
+
+@ray.remote
+def _connect_batch_remote(
+    batch: list[dict],
+    hub_lines: str,
+    source_doc: str,
+) -> list[dict]:
+    """
+    Ray remote: Stage 3 connectivity LLM call for one batch of isolated nodes.
+    """
+    cfg = get_settings()
+    client, model = _build_client(cfg)
+    isolated_lines = "\n".join(
+        f'  - {e["name"]} ({e.get("type", "OTHER")}): {e.get("description", "")}'
+        for e in batch
+    )
+    user_content = f"ISOLATED entities:\n{isolated_lines}\n\nHUB entities:\n{hub_lines}"
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _CONNECT_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_tokens=_MAX_TOKENS,
+        )
+        raw = response.choices[0].message.content or "[]"
+        try:
+            items = json.loads(raw)
+            if not isinstance(items, list):
+                items = []
+        except json.JSONDecodeError:
+            items = _recover_partial_json(raw).get("relations", [])
+        return [
+            dict(r, source_doc=source_doc)
+            for r in items
+            if r.get("source") and r.get("target") and r.get("relation")
+        ]
+    except Exception as exc:
+        logger.warning("[kg:connect] remote batch failed: %s", exc)
+        return []
+
+
 def extract_entities_relations(
     pages: list[str], source: str = ""
 ) -> tuple[list[dict], list[dict]]:
@@ -444,18 +533,26 @@ def extract_entities_relations(
             _MAX_SUBGRAPH_ENTITIES, exc,
         )
 
-    for i, page_text in enumerate(pages):
-        ref_start = time.perf_counter()
-        new_ents, new_rels = _refine_page(
-            client, model, page_text,
+    # Pre-compute relevant_entities per page (uses ColQwen locally — one pass)
+    # so Ray workers only need to do the LLM call with no GPU dependency.
+    page_relevant_entities = [
+        _retrieve_relevant_entities(page_text, entity_index, all_entities, embedder)
+        for page_text in pages
+    ]
+
+    # Submit all pages to Ray in parallel
+    futures = [
+        _refine_page_remote.remote(
+            page_text,
             all_entities[:_MAX_SUBGRAPH_ENTITIES],
             all_relations[:_MAX_SUBGRAPH_RELATIONS],
-            entity_index=entity_index,
-            embedder=embedder,
-            all_entities=all_entities,
+            page_relevant_entities[i],
         )
-        ref_elapsed = time.perf_counter() - ref_start
+        for i, page_text in enumerate(pages)
+    ]
+    refine_results = ray.get(futures)
 
+    for i, (new_ents, new_rels) in enumerate(refine_results):
         added_e = 0
         for e in new_ents:
             name_key = _s(e.get("name")).lower()
@@ -477,8 +574,8 @@ def extract_entities_relations(
         refine_entities += added_e
         refine_relations += added_r
         logger.info(
-            "[kg:refine] page %d/%d — %.2fs | +%d entities, +%d relations",
-            i + 1, total_pages, ref_elapsed, added_e, added_r,
+            "[kg:refine] page %d/%d — parallel | +%d entities, +%d relations",
+            i + 1, total_pages, added_e, added_r,
         )
 
     logger.info(
@@ -508,7 +605,21 @@ def extract_entities_relations(
         hub_names = {name for name, _ in name_degree.most_common(20)}
         hubs = [e for e in all_entities if _s(e["name"]).lower() in hub_names]
 
-        connect_rels = _link_isolated_nodes(client, model, isolated, hubs, source)
+        hub_lines = "\n".join(
+            f'  - {h["name"]} ({h.get("type", "OTHER")}): {h.get("description", "")}'
+            for h in hubs[:20]
+        )
+        # Submit all connectivity batches to Ray in parallel
+        batch_futures = [
+            _connect_batch_remote.remote(
+                isolated[start: start + _CONNECT_BATCH],
+                hub_lines,
+                source,
+            )
+            for start in range(0, len(isolated), _CONNECT_BATCH)
+        ]
+        batch_results = ray.get(batch_futures)
+        connect_rels = [r for batch in batch_results for r in batch]
 
         added_connect = 0
         for r in connect_rels:

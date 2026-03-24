@@ -1,10 +1,14 @@
 """
-Load ColQwen once (singleton) and expose embed_page / embed_query.
+Load ColQwen once (singleton) and expose embed_page / embed_query / embed_pages_batch.
 Uses MPS on Apple Silicon, falls back to CPU if unavailable.
+
+A Ray Actor wrapper (ColQwenActor) is provided so a single GPU model instance
+is shared safely across multiple Ray workers — preventing OOM from concurrent loads.
 """
 from pathlib import Path
 from functools import lru_cache
 
+import ray
 import torch
 import numpy as np
 from PIL import Image
@@ -50,6 +54,20 @@ class ColQwenEmbedder:
         vecs = embeddings[0].cpu().float().numpy()  # (n_patches, 128)
         return vecs.tolist()
 
+    def embed_pages_batch(self, img_paths: list[Path]) -> list[list[list[float]]]:
+        """
+        Embed multiple page images in a single batched forward pass.
+        Returns a list of per-page patch vectors (shape: [N, n_patches, 128]).
+        Much faster than calling embed_page N times — one GPU call instead of N.
+        """
+        images = [Image.open(p).convert("RGB") for p in img_paths]
+        inputs = self.processor.process_images(images).to(self.model.device)
+
+        with torch.no_grad():
+            embeddings = self.model(**inputs)  # (N, n_patches, 128)
+
+        return [embeddings[i].cpu().float().numpy().tolist() for i in range(len(images))]
+
     def embed_query(self, query: str) -> list[list[float]]:
         """
         Embed a text query.
@@ -77,3 +95,30 @@ class ColQwenEmbedder:
         mean_vec = vecs.mean(axis=0)                                # (128,)
         norm = np.linalg.norm(mean_vec)
         return mean_vec / norm if norm > 0 else mean_vec
+
+
+@ray.remote
+class ColQwenActor:
+    """
+    Ray Actor that holds a single ColQwen model instance.
+
+    All Ray workers (e.g. parallel ingest tasks) call this actor remotely
+    instead of loading their own copy of the model — preventing duplicate
+    GPU allocations across worker processes.
+
+    Usage (after ray.init and actor creation in main.py):
+        actor = ray.get_actor("colqwen")
+        embeddings = ray.get(actor.embed_pages_batch.remote(img_path_strs))
+    """
+
+    def __init__(self):
+        self._embedder = ColQwenEmbedder()
+
+    def embed_pages_batch(self, img_path_strs: list[str]) -> list[list[list[float]]]:
+        return self._embedder.embed_pages_batch([Path(p) for p in img_path_strs])
+
+    def embed_query(self, query: str) -> list[list[float]]:
+        return self._embedder.embed_query(query)
+
+    def embed_text_mean(self, text: str) -> list[float]:
+        return self._embedder.embed_text_mean(text).tolist()

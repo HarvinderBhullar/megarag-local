@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import ray
 
 from config.settings import get_settings
-from megarag.embedding.colqwen import _load_model  # warm up on startup
+from megarag.embedding.colqwen import ColQwenActor
 from megarag.api.routes.ingest import router as ingest_router
 from megarag.api.routes.query import router as query_router
 from megarag.api.routes.batch import router as batch_router
@@ -23,10 +24,27 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     cfg = get_settings()
     cfg.ensure_dirs()
-    logger.info("[startup] loading ColQwen model...")
-    _load_model()           # loads once, cached via lru_cache
-    logger.info("[startup] ready.")
+
+    # Initialise Ray cluster (single node, local)
+    ray.init(ignore_reinit_error=True, logging_level=logging.WARNING)
+    logger.info("[startup] Ray initialised — %s", ray.cluster_resources())
+
+    # Create a named, long-lived actor that holds the single ColQwen model.
+    # All Ray workers call this actor instead of loading their own GPU copy.
+    logger.info("[startup] loading ColQwen model via Ray actor...")
+    actor = ColQwenActor.options(
+        name="colqwen",
+        lifetime="detached",
+        get_if_exists=True,
+    ).remote()
+    # Warm up: trigger model load now (blocks until ready)
+    ray.get(actor.embed_query.remote("warmup"))
+    logger.info("[startup] ColQwen actor ready.")
+
     yield
+
+    ray.shutdown()
+    logger.info("[shutdown] Ray shut down.")
 
 
 app = FastAPI(title="MegaRAG prototype", version="0.1.0", lifespan=lifespan)

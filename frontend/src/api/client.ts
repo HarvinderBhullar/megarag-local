@@ -103,3 +103,9 @@ export async function getKGGraph(docId?: string): Promise<KGGraphResponse> {
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
+export async function listKGDocs(): Promise<string[]> {
+  const res = await fetch(`${BASE}/kg/docs`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import cytoscape, { Core, NodeSingular } from "cytoscape";
-import { getKGGraph, KGNode, KGEdge, DocInfo } from "../api/client";
+import { getKGGraph, listKGDocs, KGNode, KGEdge, DocInfo } from "../api/client";
 
 const TYPE_COLORS: Record<string, string> = {
   PERSON: "#6c8ef5",
@@ -33,6 +33,8 @@ export default function KnowledgeGraph({ docs }: Props) {
   const [selected, setSelected] = useState<NodeInfo | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [selectedDocId, setSelectedDocId] = useState<string>("");  // "" = all docs
+  // Backend-sourced doc list (survives page refreshes / server restarts)
+  const [backendDocs, setBackendDocs] = useState<DocInfo[]>([]);
 
   const loadGraph = useCallback(async (docId?: string) => {
     if (!containerRef.current) return;
@@ -167,21 +169,43 @@ export default function KnowledgeGraph({ docs }: Props) {
     }
   }, []);
 
-  // Reload graph whenever the selected doc changes
+  // Fetch available docs from backend — works after page refresh / server restart
+  const refreshDocs = useCallback(async () => {
+    try {
+      const ids = await listKGDocs();
+      setBackendDocs(ids.map((id) => ({ doc_id: id, document: id })));
+    } catch {
+      // silently ignore — backend may still be starting
+    }
+  }, []);
+
+  // Reload graph when the selected doc scope changes (also covers initial mount)
   useEffect(() => {
+    refreshDocs();
     loadGraph(selectedDocId || undefined);
     return () => {
       cyRef.current?.destroy();
+      cyRef.current = null;
     };
   }, [selectedDocId]);
 
-  // Initial load
+  // Reload graph when a new document finishes ingestion (SSE-driven)
   useEffect(() => {
-    loadGraph();
-    return () => {
-      cyRef.current?.destroy();
-    };
-  }, []);
+    if (docs.length > 0) {
+      refreshDocs();
+      loadGraph(selectedDocId || undefined);
+    }
+  }, [docs.length]);
+
+  // Auto-poll every 15s while graph is empty (extraction still in progress)
+  useEffect(() => {
+    if (nodeCount > 0) return;
+    const timer = setInterval(async () => {
+      await refreshDocs();
+      loadGraph(selectedDocId || undefined);
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [nodeCount, selectedDocId]);
 
   const handleSearch = (term: string) => {
     setSearchTerm(term);
@@ -233,7 +257,12 @@ export default function KnowledgeGraph({ docs }: Props) {
             }}
           >
             <option value="">All documents</option>
-            {docs.map((d) => (
+            {/* Merge SSE-driven docs with backend-sourced docs (deduped) */}
+            {Array.from(
+              new Map(
+                [...backendDocs, ...docs].map((d) => [d.doc_id, d])
+              ).values()
+            ).map((d) => (
               <option key={d.doc_id} value={d.doc_id}>
                 {d.document}
               </option>
@@ -285,6 +314,11 @@ export default function KnowledgeGraph({ docs }: Props) {
           <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
             {nodeCount} nodes · {edgeCount} edges
           </span>
+          {nodeCount === 0 && !loading && (
+            <span style={{ color: "var(--text-muted)", fontSize: 11, fontStyle: "italic" }}>
+              ⏳ Extraction in progress — auto-refreshing every 15s
+            </span>
+          )}
         </div>
 
         {loading && (

@@ -4,24 +4,13 @@ from megarag.knowledge_graph.schema import init_db
 
 
 class KGStore:
-    def __init__(self, db_path: Path, schema: str = "main", read_only: bool = False):
+    def __init__(self, db_path: Path, schema: str = "main"):
         self.schema = schema
         # Shorthand so every SQL reference is schema-qualified.
         # DuckDB accepts 'main.entities' just like bare 'entities'.
         self._e = f"{schema}.entities"
         self._r = f"{schema}.relations"
-
-        if read_only:
-            if not db_path.exists():
-                raise FileNotFoundError(
-                    f"Knowledge graph database not found at '{db_path}'. "
-                    "Upload and ingest at least one document first."
-                )
-            self.conn: duckdb.DuckDBPyConnection = duckdb.connect(
-                str(db_path), read_only=True
-            )
-        else:
-            self.conn = init_db(db_path, schema)
+        self.conn: duckdb.DuckDBPyConnection = init_db(db_path, schema)
 
     # ------------------------------------------------------------------
     # Class-level helpers — discover which per-doc schemas exist
@@ -32,12 +21,17 @@ class KGStore:
         """Return all per-document schema names (prefix 'doc_') in the database."""
         if not db_path.exists():
             return []
+        # read_only=True allows concurrent access alongside active ingest write locks.
+        # Data is visible because pipeline.py explicitly closes the write connection
+        # (WAL checkpoint) before ingest_document returns.
         conn = duckdb.connect(str(db_path), read_only=True)
-        rows = conn.execute(
-            "SELECT schema_name FROM information_schema.schemata "
-            "WHERE schema_name LIKE 'doc_%'"
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE schema_name LIKE 'doc_%'"
+            ).fetchall()
+        finally:
+            conn.close()
         return [r[0] for r in rows]
 
     # ------------------------------------------------------------------

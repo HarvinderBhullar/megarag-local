@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import List
 
+import ray
+
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, status
 from fastapi.responses import StreamingResponse
 
@@ -55,10 +57,11 @@ async def batch_ingest(
         saved.append((upload.filename or dest.name, dest))
 
     job = create_job([fn for fn, _ in saved])
-    # Ensure queue exists in the current event loop before handing off
-    job.get_queue()
+    # Capture the main event loop so the background thread can safely post events
+    main_loop = asyncio.get_event_loop()
+    job.get_queue()  # create queue now, in the main loop
 
-    background_tasks.add_task(_run_batch, job, saved)
+    background_tasks.add_task(_run_batch, job, saved, main_loop)
 
     return BatchIngestResponse(job_id=job.job_id, total_files=len(saved))
 
@@ -121,70 +124,86 @@ async def batch_status(job_id: str) -> BatchStatusResponse:
 # Background worker
 # ---------------------------------------------------------------------------
 
-def _run_batch(job: BatchJob, saved: list[tuple[str, Path]]) -> None:
+@ray.remote
+def _ingest_remote(pdf_path_str: str) -> dict:
+    """Ray remote task: run ingest_document in a worker process."""
+    return ingest_document(Path(pdf_path_str))
+
+
+def _run_batch(
+    job: BatchJob,
+    saved: list[tuple[str, Path]],
+    main_loop: asyncio.AbstractEventLoop,
+) -> None:
     """
     Runs in a background thread (via BackgroundTasks).
-    Processes each file sequentially and pushes SSE events onto the job queue.
+    All files are submitted to Ray simultaneously and processed in parallel.
+    SSE events are emitted as each file completes via call_soon_threadsafe.
     """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    queue = job.get_queue()
 
-    async def _process():
-        queue = job.get_queue()
-        job.overall_status = "processing"
-        total = len(saved)
-        failed = 0
+    def emit(event: str, data: dict) -> None:
+        main_loop.call_soon_threadsafe(queue.put_nowait, (event, data))
 
-        for idx, (filename, pdf_path) in enumerate(saved):
-            file_status = job.files[idx]
-            file_status.status = "processing"
+    job.overall_status = "processing"
+    total = len(saved)
+    failed = 0
 
-            await queue.put(("file_start", {
+    # Submit all files to Ray in parallel — emit file_start immediately for each
+    futures: dict = {}
+    for idx, (filename, pdf_path) in enumerate(saved):
+        job.files[idx].status = "processing"
+        emit("file_start", {
+            "job_id": job.job_id,
+            "filename": filename,
+            "index": idx,
+            "total": total,
+        })
+        future = _ingest_remote.remote(str(pdf_path))
+        futures[future] = (idx, filename, pdf_path)
+
+    # Collect results as they complete (in completion order, not submission order)
+    pending = list(futures.keys())
+    while pending:
+        done, pending = ray.wait(pending, num_returns=1, timeout=None)
+        future = done[0]
+        idx, filename, pdf_path = futures[future]
+
+        try:
+            result = ray.get(future)
+            job.files[idx].status = "done"
+            job.files[idx].pages = result["pages"]
+            job.files[idx].entities = result["entities"]
+            job.files[idx].relations = result["relations"]
+
+            emit("file_done", {
                 "job_id": job.job_id,
                 "filename": filename,
-                "index": idx,
-                "total": total,
-            }))
+                "doc_id": result["doc_id"],
+                "pages": result["pages"],
+                "entities": result["entities"],
+                "relations": result["relations"],
+            })
+        except Exception as exc:
+            failed += 1
+            job.files[idx].status = "failed"
+            job.files[idx].error = str(exc)
 
+            emit("file_error", {
+                "job_id": job.job_id,
+                "filename": filename,
+                "error": str(exc),
+            })
+        finally:
             try:
-                result = ingest_document(pdf_path)
-                file_status.status = "done"
-                file_status.pages = result["pages"]
-                file_status.entities = result["entities"]
-                file_status.relations = result["relations"]
+                pdf_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-                await queue.put(("file_done", {
-                    "job_id": job.job_id,
-                    "filename": filename,
-                    "doc_id": result["doc_id"],
-                    "pages": result["pages"],
-                    "entities": result["entities"],
-                    "relations": result["relations"],
-                }))
-            except Exception as exc:
-                failed += 1
-                file_status.status = "failed"
-                file_status.error = str(exc)
-
-                await queue.put(("file_error", {
-                    "job_id": job.job_id,
-                    "filename": filename,
-                    "error": str(exc),
-                }))
-            finally:
-                # Clean up temp file
-                try:
-                    pdf_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        job.overall_status = "failed" if failed == total else "done"
-        await queue.put(("batch_done", {
-            "job_id": job.job_id,
-            "total_files": total,
-            "failed": failed,
-            "overall_status": job.overall_status,
-        }))
-
-    loop.run_until_complete(_process())
-    loop.close()
+    job.overall_status = "failed" if failed == total else "done"
+    emit("batch_done", {
+        "job_id": job.job_id,
+        "total_files": total,
+        "failed": failed,
+        "overall_status": job.overall_status,
+    })

@@ -82,30 +82,39 @@ def ingest_document(pdf_path: Path) -> dict:
     kg = KGStore(cfg.kg_db_path, schema=schema)
     kg.upsert_entities(entities)
     kg.upsert_relations(relations)
+    kg.conn.close()  # Checkpoint WAL so read-only connections see the data immediately
     t = _step(
         f"KG extraction + store ({len(entities)} entities, {len(relations)} relations)", t
     )
 
     # 4. Embed page images with ColQwen → this document's own Qdrant collection
-    logger.info("[ingest] Step 4/4 — embedding pages with ColQwen → Qdrant (%s)", collection_name)
-    embedder = ColQwenEmbedder()
+    logger.info("[ingest] Step 4/4 — embedding %d pages with ColQwen (batch) → Qdrant (%s)",
+                len(page_images), collection_name)
     qdrant = QdrantStore(collection_name=collection_name)
 
-    for idx, img_path in enumerate(tqdm(page_images, desc="embedding")):
-        page_start = time.perf_counter()
-        embeddings = embedder.embed_page(img_path)
+    # Use the shared Ray actor when available (single GPU model across all workers).
+    # Falls back to local batch embedding if Ray is not initialised.
+    try:
+        import ray as _ray
+        actor = _ray.get_actor("colqwen")
+        all_embeddings: list = _ray.get(
+            actor.embed_pages_batch.remote([str(p) for p in page_images])
+        )
+        logger.debug("[ingest]   used ColQwen Ray actor for batch embedding")
+    except Exception:
+        embedder = ColQwenEmbedder()
+        all_embeddings = embedder.embed_pages_batch(page_images)
+        logger.debug("[ingest]   used local ColQwen for batch embedding")
+
+    for idx, (img_path, embeddings) in enumerate(zip(page_images, all_embeddings)):
         qdrant.upsert_page(
             doc_name=pdf_path.name,
             page_index=idx,
             img_path=img_path,
             embeddings=embeddings,
         )
-        logger.debug(
-            "[ingest]   page %d/%d embedded in %.2fs",
-            idx + 1, len(page_images), time.perf_counter() - page_start,
-        )
 
-    _step(f"ColQwen embedding + Qdrant upsert ({len(page_images)} pages)", t)
+    _step(f"ColQwen batch embedding + Qdrant upsert ({len(page_images)} pages)", t)
 
     total = time.perf_counter() - pipeline_start
     logger.info(

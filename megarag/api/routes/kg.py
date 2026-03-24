@@ -1,12 +1,14 @@
 """
 Knowledge graph route.
 
+GET /kg/docs                — list all ingested document IDs
 GET /kg/graph               — returns combined graph across all documents
 GET /kg/graph?doc_id=<id>   — scoped to a single document (doc_id from /ingest)
 """
 import logging
-from typing import Optional
+from typing import List, Optional
 
+import duckdb
 from fastapi import APIRouter, Query
 
 from config.settings import get_settings
@@ -16,6 +18,18 @@ from megarag.knowledge_graph.store import KGStore
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/kg", tags=["knowledge-graph"])
+
+
+@router.get("/docs", response_model=List[str])
+def list_kg_docs() -> List[str]:
+    """
+    Return a list of document IDs (the 'doc_id' from /ingest) that have
+    completed ingestion and have knowledge graph data available.
+    """
+    cfg = get_settings()
+    schemas = KGStore.list_doc_schemas(cfg.kg_db_path)
+    # Strip the "doc_" prefix to get back the original doc_id
+    return [s[len("doc_"):] for s in schemas]
 
 
 @router.get("/graph", response_model=KGGraphResponse)
@@ -47,11 +61,25 @@ def get_kg_graph(
 
     for schema in schemas:
         try:
-            store = KGStore(cfg.kg_db_path, schema=schema, read_only=True)
-        except FileNotFoundError:
+            conn = duckdb.connect(str(cfg.kg_db_path), read_only=True)
+        except Exception:
             continue
-        all_entity_rows.extend(store.get_all_entities(limit=500))
-        all_rel_rows.extend(store.get_all_relations(limit=1000))
+        try:
+            e_tbl = f"{schema}.entities"
+            r_tbl = f"{schema}.relations"
+            all_entity_rows.extend(
+                conn.execute(f"SELECT id, name, type, description FROM {e_tbl} LIMIT 500").fetchall()
+            )
+            all_rel_rows.extend(
+                conn.execute(
+                    f"SELECT id, source_ent, relation, target_ent, description, keywords "
+                    f"FROM {r_tbl} LIMIT 1000"
+                ).fetchall()
+            )
+        except Exception:
+            continue
+        finally:
+            conn.close()
 
     # Cap totals after merging across schemas.
     entity_rows = all_entity_rows[:500]

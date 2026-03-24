@@ -1,5 +1,5 @@
-import React, { useState, useCallback } from "react";
-import { query, QueryResponse, DocInfo } from "../api/client";
+import React, { useState, useCallback, useEffect } from "react";
+import { query, QueryResponse, DocInfo, listKGDocs } from "../api/client";
 
 interface Props {
   docs: DocInfo[];
@@ -10,6 +10,19 @@ export default function QueryPanel({ docs }: Props) {
   const [topK, setTopK] = useState(5);
   const [selectedDocId, setSelectedDocId] = useState<string>("");  // "" = all docs
   const [loading, setLoading] = useState(false);
+  const [backendDocs, setBackendDocs] = useState<DocInfo[]>([]);
+
+  // Load available docs from backend on mount — survives page refresh
+  useEffect(() => {
+    listKGDocs()
+      .then((ids) => setBackendDocs(ids.map((id) => ({ doc_id: id, document: id }))))
+      .catch(() => {});
+  }, []);
+
+  // Merge backend docs with SSE-driven docs (deduped by doc_id)
+  const allDocs = Array.from(
+    new Map([...backendDocs, ...docs].map((d) => [d.doc_id, d])).values()
+  );
   const [result, setResult] = useState<QueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<string | null>(null);
@@ -111,7 +124,7 @@ export default function QueryPanel({ docs }: Props) {
             }}
           >
             <option value="">All documents</option>
-            {docs.map((d) => (
+            {allDocs.map((d) => (
               <option key={d.doc_id} value={d.doc_id}>
                 {d.document}
               </option>
